@@ -14,6 +14,7 @@ import triton.language as tl
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa
 
@@ -135,17 +136,136 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
+def _apply_causal_verify_repetition_penalty(
+    *,
+    logits: torch.Tensor,
+    baseline_scaling_penalties: torch.Tensor,
+    repetition_penalty_factors: Optional[torch.Tensor],
+    verify_token_ids: Optional[torch.Tensor],
+    valid_lens: Optional[torch.Tensor],
+) -> None:
+    """Make repetition penalty causal within a linear verify chain.
+
+    ``baseline_scaling_penalties`` has already been applied to every row.  A
+    token newly introduced by this speculative block must become repeated for
+    all later target rows, but repetition is set-based: duplicate draft tokens
+    must not receive an additional factor for every occurrence.
+    """
+    if repetition_penalty_factors is None or verify_token_ids is None:
+        return
+
+    if logits.ndim != 3:
+        raise ValueError(
+            "causal repetition adjustment expects [batch, verify_width, vocab] logits, "
+            f"got shape={tuple(logits.shape)}."
+        )
+
+    bs, verify_width, vocab_size = logits.shape
+    if verify_token_ids.ndim != 2 or verify_token_ids.shape != (bs, verify_width):
+        raise ValueError(
+            "verify_token_ids must have shape [batch, verify_width], "
+            f"got {tuple(verify_token_ids.shape)} for logits {tuple(logits.shape)}."
+        )
+    if baseline_scaling_penalties.shape != (bs, vocab_size):
+        raise ValueError(
+            "baseline scaling penalties must have shape [batch, vocab], "
+            f"got {tuple(baseline_scaling_penalties.shape)} for logits "
+            f"{tuple(logits.shape)}."
+        )
+    if repetition_penalty_factors.ndim != 2 or repetition_penalty_factors.shape != (
+        bs,
+        1,
+    ):
+        raise ValueError(
+            "repetition penalty factors must have shape [batch, 1], "
+            f"got {tuple(repetition_penalty_factors.shape)}."
+        )
+
+    device = logits.device
+    token_ids = verify_token_ids.to(device=device, dtype=torch.long)
+    baseline_scaling_penalties = baseline_scaling_penalties.to(device=device)
+    repetition_penalty_factors = repetition_penalty_factors.to(
+        device=device, dtype=logits.dtype
+    )
+
+    if valid_lens is None:
+        valid_lens = torch.full((bs,), verify_width, dtype=torch.long, device=device)
+    else:
+        if valid_lens.ndim != 1 or valid_lens.shape[0] != bs:
+            raise ValueError(
+                "valid_lens must have shape [batch], "
+                f"got {tuple(valid_lens.shape)} for batch size {bs}."
+            )
+        # Compact verify rows are a prefix for each request. Clamping avoids
+        # touching bucket padding while preserving the valid prefix exactly.
+        valid_lens = valid_lens.to(device=device, dtype=torch.long).clamp(
+            min=0, max=verify_width
+        )
+
+    # Column zero is the committed anchor. Token at column ``j`` is visible to
+    # target-logit rows j..T-1, since row j predicts after that draft token.
+    candidate_ids = token_ids[:, 1:]
+    candidate_positions = torch.arange(1, verify_width, device=device)
+    candidate_is_valid = candidate_positions[None, :] < valid_lens[:, None]
+    # Compact layouts may leave sentinels in the pruned suffix. Replace those
+    # ids before gather; the validity mask below guarantees they remain no-ops.
+    safe_candidate_ids = torch.where(candidate_is_valid, candidate_ids, 0)
+    baseline_candidate_scaling = baseline_scaling_penalties.gather(
+        dim=1, index=safe_candidate_ids
+    )
+
+    for token_col in range(1, verify_width):
+        candidate = safe_candidate_ids[:, token_col - 1]
+        baseline_unseen = baseline_candidate_scaling[:, token_col - 1].eq(1)
+        if token_col == 1:
+            first_in_block = torch.ones_like(baseline_unseen, dtype=torch.bool)
+        else:
+            first_in_block = ~(
+                safe_candidate_ids[:, : token_col - 1] == candidate[:, None]
+            ).any(dim=1)
+
+        # A candidate outside a compact request's valid prefix has no target
+        # row and must not affect the padded suffix.
+        first_new_candidate = (
+            baseline_unseen & first_in_block & (token_col < valid_lens)
+        )
+        row_positions = torch.arange(token_col, verify_width, device=device)
+        row_is_valid = row_positions[None, :] < valid_lens[:, None]
+
+        # Keep the row-major [B, T, V] layout throughout. Gather/scatter only
+        # the one candidate column for each request, so distinct batch rows do
+        # not alias and a repeated candidate can never be multiplied by r^2.
+        suffix_logits = logits[:, token_col:, :]
+        token_index = candidate[:, None, None].expand(bs, verify_width - token_col, 1)
+        selected_logits = suffix_logits.gather(dim=2, index=token_index)
+        scaled_logits = torch.where(
+            selected_logits < 0,
+            selected_logits * repetition_penalty_factors[:, None, :],
+            selected_logits / repetition_penalty_factors[:, None, :],
+        )
+        apply_mask = first_new_candidate[:, None] & row_is_valid
+        suffix_logits.scatter_(
+            dim=2,
+            index=token_index,
+            src=torch.where(apply_mask[:, :, None], scaled_logits, selected_logits),
+        )
+
+
 def apply_dflash_verify_logits_adjustments(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    verify_token_ids: Optional[torch.Tensor] = None,
+    valid_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    This keeps DFlash-family verify aligned with ordinary sampling while using
+    precomputed penalty tensors broadcast over the verify block instead of
+    materializing repeated ``[bs * draft_token_num, vocab]`` buffers. When
+    verify tokens are supplied, repetition penalty additionally observes the
+    causal draft prefix for every later row of the chain.
     """
     if sampling_info is None:
         return
@@ -171,7 +291,11 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+    acc_scaling_penalties = getattr(sampling_info, "acc_scaling_penalties", None)
+    acc_repetition_penalty_factors = getattr(
+        sampling_info, "acc_repetition_penalty_factors", None
+    )
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
@@ -184,33 +308,59 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
+    # A forward-only SamplingBatchInfo has its live orchestrator removed and carries
+    # the accumulated tensors instead. Keep the live path for direct/eager callers,
+    # but never use it alongside either accumulated tensor: that would apply the
+    # same penalizers twice.
     if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
-        linear_penalty = torch.zeros(
-            (bs, next_token_logits.shape[1]),
-            dtype=torch.float32,
-            device=next_token_logits.device,
-        )
-        sampling_info.apply_logits_bias(linear_penalty)
-        get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
-        )
-        return
+        penalizer is not None
+        and penalizer.is_required
+        and acc_additive_penalties is None
+        and acc_scaling_penalties is None
+    ):
+        penalizer.apply(next_token_logits, repeat=draft_token_num)
 
-    if acc_linear_penalties is not None:
+    if acc_additive_penalties is not None:
         if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
+            acc_additive_penalties.device != next_token_logits.device
+            or acc_additive_penalties.dtype != next_token_logits.dtype
         ):
-            acc_linear_penalties = acc_linear_penalties.to(
+            acc_additive_penalties = acc_additive_penalties.to(
                 device=next_token_logits.device,
                 dtype=next_token_logits.dtype,
             )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+        get_logits_3d().add_(acc_additive_penalties[:, None, :])
+
+    if acc_scaling_penalties is not None:
+        if acc_scaling_penalties.device != next_token_logits.device:
+            acc_scaling_penalties = acc_scaling_penalties.to(
+                device=next_token_logits.device
+            )
+        # Repetition penalties are sign-sensitive: divide positive logits and
+        # multiply negative logits. Apply them to the real verify logits rather
+        # than to a zero bias buffer, which would silently turn this into a no-op.
+        apply_scaling_penalties(get_logits_3d(), acc_scaling_penalties[:, None, :])
+        _apply_causal_verify_repetition_penalty(
+            logits=get_logits_3d(),
+            baseline_scaling_penalties=acc_scaling_penalties,
+            repetition_penalty_factors=acc_repetition_penalty_factors,
+            verify_token_ids=verify_token_ids,
+            valid_lens=valid_lens,
+        )
+
+    # DFlash/DSpark workers normally install a tree-specific GrammarMask after
+    # this helper. Retain the generic SamplingBatchInfo path for callers that
+    # provide one directly. Its rows are per request (not per verify position),
+    # so turn it into a bias and broadcast it just as the pre-GrammarMask API
+    # did; applying it directly to bs * draft_token_num rows is shape-incorrect.
+    if grammar_mask is not None:
+        grammar_bias = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=next_token_logits.dtype,
+            device=next_token_logits.device,
+        )
+        grammar_mask.apply(grammar_bias)
+        get_logits_3d().add_(grammar_bias[:, None, :])
 
     if logit_bias is not None:
         if (

@@ -1037,6 +1037,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
+        # DFlash and DSpark own their allocation/sequence preparation, but the
+        # scheduler owns penalty accounting. A speculative verify can commit more
+        # than one token, so update the shared per-request cursor before either
+        # worker starts its next proposal.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.cumulate_penalty_output_tokens()
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

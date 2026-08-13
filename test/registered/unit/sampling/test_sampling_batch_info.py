@@ -6,12 +6,16 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.sampling.penaltylib.frequency_penalty import (
+    BatchedFrequencyPenalizer,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     merge_bias_tensor,
@@ -480,6 +484,7 @@ class TestFromScheduleBatch(CustomTestCase):
         min_p=0.0,
         freq=0.0,
         presence=0.0,
+        repetition=1.0,
         min_tokens=0,
         logit_bias=None,
         seed=None,
@@ -493,6 +498,7 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.min_p = min_p
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
+        req.sampling_params.repetition_penalty = repetition
         req.sampling_params.min_new_tokens = min_tokens
         req.sampling_params.logit_bias = logit_bias
         req.sampling_params.sampling_seed = seed
@@ -501,6 +507,10 @@ class TestFromScheduleBatch(CustomTestCase):
         req.custom_logit_processor = None
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
+        req.origin_input_ids = array("q", [1, 2])
+        req.output_ids = array("q")
+        req.penalty_fed_len = 0
+        req.penalty_fed_origin_token = False
         return req
 
     def test_basic_construction(self):
@@ -575,6 +585,60 @@ class TestFromScheduleBatch(CustomTestCase):
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
+
+    def test_rebuild_hydrates_ragged_output_penalty_history(self):
+        req1 = self._make_req(freq=1.0, repetition=1.5)
+        req1.output_ids.extend([3, 3, 7])
+        req1.penalty_fed_len = 99
+        req2 = self._make_req(freq=1.0, repetition=2.0)
+        req2.output_ids.append(9)
+        req2.penalty_fed_len = 99
+        batch = MagicMock(requires_grad=False)
+        batch.reqs = [req1, req2]
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        frequency = info.penalizer_orchestrator.penalizers[
+            BatchedFrequencyPenalizer
+        ].cumulated_frequency_penalties
+
+        self.assertEqual(frequency[0, 3].item(), 2.0)
+        self.assertEqual(frequency[0, 7].item(), 1.0)
+        self.assertEqual(frequency[1, 9].item(), 1.0)
+        self.assertEqual([req1.penalty_fed_len, req2.penalty_fed_len], [3, 1])
+
+    def test_rebuild_replays_prompt_tail_only_when_previously_fed(self):
+        req_with_fallback = self._make_req(freq=1.0)
+        req_with_fallback.penalty_fed_origin_token = True
+        req_without_fallback = self._make_req(freq=1.0)
+        batch = MagicMock()
+        batch.reqs = [req_with_fallback, req_without_fallback]
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        frequency = info.penalizer_orchestrator.penalizers[
+            BatchedFrequencyPenalizer
+        ].cumulated_frequency_penalties
+
+        self.assertEqual(frequency[0, 2].item(), 1.0)
+        self.assertEqual(frequency[1].sum().item(), 0.0)
+        self.assertTrue(req_with_fallback.penalty_fed_origin_token)
+        self.assertFalse(req_without_fallback.penalty_fed_origin_token)
+
+    def test_forward_copy_carries_repetition_factor_and_seen_state(self):
+        req = self._make_req(repetition=1.5)
+        req.output_ids.append(3)
+        batch = MagicMock()
+        batch.reqs = [req]
+        batch.device = DEVICE
+
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        copied = info.copy_for_forward()
+
+        self.assertIsNone(copied.penalizer_orchestrator)
+        self.assertEqual(copied.acc_repetition_penalty_factors.item(), 1.5)
+        self.assertEqual(copied.acc_scaling_penalties[0, 3].item(), 1.5)
+        self.assertEqual(copied.acc_scaling_penalties[0, 4].item(), 1.0)
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""

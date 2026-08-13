@@ -1705,6 +1705,30 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _has_pending_dflash_penalty_result(self) -> bool:
+        """Whether the pending overlap result must be materialized before prep.
+
+        DFlash-family workers consume penalty state while building their next
+        speculative proposal.  Unlike ordinary decode, a target verify can emit
+        a ragged run of tokens, and grammar may trim that run on the CPU.  Drain
+        the preceding result before ``get_next_batch_to_run`` rebuilds/merges a
+        sampling batch so the regular cursor-based accumulation sees exactly the
+        retained output.  This intentionally gives up one iteration of CPU/GPU
+        overlap only for requests that actually use penalties.
+        """
+        if not self.result_queue or self.last_batch is None:
+            return False
+
+        batch = self.last_batch
+        spec_algorithm = getattr(batch, "spec_algorithm", None)
+        is_dflash_family = getattr(spec_algorithm, "is_dflash_family", None)
+        if is_dflash_family is None or not is_dflash_family():
+            return False
+
+        sampling_info = getattr(batch, "sampling_info", None)
+        orchestrator = getattr(sampling_info, "penalizer_orchestrator", None)
+        return orchestrator is not None and orchestrator.is_required
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1762,6 +1786,14 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # DFlash/DSpark must see the CPU-retained output (including grammar
+            # truncation) before preparation of the next speculative step.  Do
+            # this before get_next_batch_to_run(), because that function may
+            # merge/rebuild SamplingBatchInfo and immediately prepare decode.
+            drained_dflash_penalty_result = self._has_pending_dflash_penalty_result()
+            if drained_dflash_penalty_result:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1775,7 +1807,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and self.result_queue:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -1798,7 +1830,11 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not drained_dflash_penalty_result
+                    and self.result_queue
+                ):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -4622,6 +4658,10 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                    # The next decode batch gets a fresh SamplingBatchInfo.
+                    # Its history hydration will replay the retained prefix and
+                    # the prompt-tail fallback iff the old state contained it;
+                    # the popped handoff token is no longer in output_ids.
                 req.pd_rebootstrap_in_progress = True
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)

@@ -869,6 +869,14 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Number of output_ids entries already fed to the sampling penalizers.
+        # A speculative verify may commit several tokens at once, so decode steps
+        # are not a valid cursor for penalty state.
+        self.penalty_fed_len = 0
+        # Whether the prompt tail fallback was fed to the *current* penalty
+        # state.  ``penalty_fed_len`` alone cannot represent this while there
+        # are no generated output tokens yet.
+        self.penalty_fed_origin_token = False
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1704,7 +1712,6 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
         # output_ids will have no use, but will lead to wrong size cache indexes.
@@ -2996,22 +3003,72 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def cumulate_penalty_output_tokens(self):
         # Under overlap batch.input_ids is just a placeholder here -- the
         # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
+        # entry. So take the output tokens from Req directly
         # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
+        #
+        # Feed every token appended since the previous call, not only the tail:
+        # speculative verify commits a variable number of accepted tokens per
+        # request. A single tail token would permanently hide the rest from the
+        # frequency, presence, repetition, and min-new-token penalizers.
+        orchestrator = self.sampling_info.penalizer_orchestrator
+        if orchestrator is None or not orchestrator.is_required:
+            return
+
+        pending = []
+        for req in self.reqs:
+            if req.penalty_fed_len > len(req.output_ids):
+                # A live penalizer has no inverse update, so replaying retained
+                # tokens after an in-place truncation would make its state even
+                # less accurate. Normal retraction builds a fresh
+                # SamplingBatchInfo (which hydrates retained output history),
+                # so this is only a defensive fallback for nonstandard callers.
+                req.penalty_fed_len = len(req.output_ids)
+
+            new_tokens = req.output_ids[req.penalty_fed_len :]
+            if new_tokens:
+                req.penalty_fed_len = len(req.output_ids)
+            elif len(req.output_ids) == 0 and not req.penalty_fed_origin_token:
+                # First decode, before a generated token exists.
+                new_tokens = req.origin_input_ids[-1:]
+                req.penalty_fed_origin_token = True
+            pending.append(new_tokens)
+
+        max_new = max((len(tokens) for tokens in pending), default=0)
+        if max_new == 0:
+            return
+
         # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
         # pin_memory (matching the prefill-path tensors) keeps the copy async;
         # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
+        pin_memory = is_pin_memory_available(self.device)
+        if all(len(tokens) == 1 for tokens in pending):
+            # Retain the simple 1-D fast path for ordinary decode steps.
+            latest_output_ids = torch.tensor(
+                [tokens[0] for tokens in pending],
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(self.device, non_blocking=True)
+            orchestrator.cumulate_output_tokens(latest_output_ids)
+            return
+
+        # Ragged speculative accepts: padding ids are never observed by a
+        # penalizer because the matching boolean mask gates every update.
+        padded_ids = torch.tensor(
+            [list(tokens) + [0] * (max_new - len(tokens)) for tokens in pending],
             dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
+            pin_memory=pin_memory,
+        )
+        mask = torch.tensor(
+            [
+                [True] * len(tokens) + [False] * (max_new - len(tokens))
+                for tokens in pending
+            ],
+            dtype=torch.bool,
+            pin_memory=pin_memory,
+        )
+        orchestrator.cumulate_output_tokens(
+            padded_ids.to(self.device, non_blocking=True),
+            mask.to(self.device, non_blocking=True),
         )
 
     def prepare_for_decode(self):

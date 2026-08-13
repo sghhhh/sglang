@@ -60,6 +60,11 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Forward-only snapshot of per-request repetition factors. The accumulated
+    # scaling table says which vocabulary items are already seen; this scalar is
+    # needed to make later rows of a speculative verify chain see a newly
+    # drafted token exactly once.
+    acc_repetition_penalty_factors: Optional[torch.Tensor] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -217,7 +222,76 @@ class SamplingBatchInfo:
             sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
+        ret._hydrate_penalty_output_history(batch)
         return ret
+
+    def _hydrate_penalty_output_history(self, batch: ScheduleBatch) -> None:
+        """Restore output-token penalty state for a newly built batch info.
+
+        A ``SamplingBatchInfo`` owns its penalizer tensors.  Some scheduling
+        paths (retraction/re-prefill, HiSparse transition, and prebuilt decode)
+        intentionally create a new one for requests that already have generated
+        output.  Their old per-request cursor must not cause that fresh state to
+        skip history. Generated output is always replayed. The prompt tail is
+        replayed only if the old state actually consumed the overlap fallback
+        before the first generated token was materialized; preserving that bit
+        keeps a rebuild equivalent without changing the normal output-only path.
+        """
+        histories = []
+        for req in batch.reqs:
+            history = []
+            if req.penalty_fed_origin_token:
+                history.extend(req.origin_input_ids[-1:])
+            history.extend(req.output_ids)
+            histories.append(history)
+        max_len = max((len(history) for history in histories), default=0)
+
+        if max_len == 0:
+            # A fresh state has not seen generated output.  Resetting the
+            # cursor here also covers rebuilds after a retained suffix was
+            # trimmed before the batch was reconstructed.
+            for req in batch.reqs:
+                req.penalty_fed_len = 0
+            return
+
+        orchestrator = self.penalizer_orchestrator
+        if orchestrator is not None and orchestrator.is_required:
+            pin_memory = is_pin_memory_available(batch.device)
+            if all(len(history) == 1 for history in histories):
+                output_ids = torch.tensor(
+                    [history[0] for history in histories],
+                    dtype=torch.int64,
+                    pin_memory=pin_memory,
+                ).to(batch.device, non_blocking=True)
+                orchestrator.cumulate_output_tokens(output_ids)
+            else:
+                padded_ids = torch.tensor(
+                    [
+                        list(history) + [0] * (max_len - len(history))
+                        for history in histories
+                    ],
+                    dtype=torch.int64,
+                    pin_memory=pin_memory,
+                )
+                mask = torch.tensor(
+                    [
+                        [True] * len(history) + [False] * (max_len - len(history))
+                        for history in histories
+                    ],
+                    dtype=torch.bool,
+                    pin_memory=pin_memory,
+                )
+                orchestrator.cumulate_output_tokens(
+                    padded_ids.to(batch.device, non_blocking=True),
+                    mask.to(batch.device, non_blocking=True),
+                )
+
+        # The fresh state now represents the same logical history (or has no
+        # active penalties at all), so the next decode only feeds newly appended
+        # output tokens. ``penalty_fed_origin_token`` remains unchanged because
+        # the fallback, when present, was replayed above.
+        for req in batch.reqs:
+            req.penalty_fed_len = len(req.output_ids)
 
     # placeholder for override
     def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
@@ -276,9 +350,13 @@ class SamplingBatchInfo:
             self.acc_scaling_penalties = (
                 self.penalizer_orchestrator.accumulate_scaling_penalties()
             )
+            self.acc_repetition_penalty_factors = (
+                self.penalizer_orchestrator.get_repetition_penalty_factors()
+            )
         else:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
+            self.acc_repetition_penalty_factors = None
 
     def apply_logits_bias(self, logits: torch.Tensor):
         if self.acc_additive_penalties is not None:

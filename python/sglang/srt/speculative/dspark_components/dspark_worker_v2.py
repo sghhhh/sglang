@@ -636,6 +636,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
         )
 
+        # Target verification installs its tree-shaped GrammarMask after the
+        # forward below.  A SamplingBatchInfo can still carry the per-request
+        # mask from a preceding extend stage; do not let the generic logits
+        # adjustment helper apply that stale ``[bs, vocab]`` mask before the
+        # tree ``[bs * verify_width, vocab]`` mask is built.
+        if batch.has_grammar and sampling_info is not None:
+            sampling_info.grammar_mask = None
+
         # A live grammar forces the eager path: the folded epilogue accepts inside
         # the cuda graph off its own buffers, where the mask below never lands.
         fold_eligible = (
@@ -657,6 +665,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     layout=layout,
                     draft_block_ids=draft_block_ids,
                     draft_tokens=draft_tokens,
+                    verify_ids_2d=verify_ids_2d,
                     bs=bs,
                     device=device,
                     sampling_info=sampling_info,

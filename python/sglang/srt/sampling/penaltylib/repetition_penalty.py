@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
@@ -45,11 +47,23 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             )
         ).unsqueeze_(1)
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
+        index = output_ids.unsqueeze(1)
+        src = self.repetition_penalties
+        if mask is not None:
+            # scatter_ overwrites. For padding, preserve the existing scaling
+            # factor (normally 1.0) rather than marking token 0 as repeated.
+            src = torch.where(
+                mask.unsqueeze(1),
+                src,
+                self.cumulated_repetition_penalties.gather(1, index),
+            )
         self.cumulated_repetition_penalties.scatter_(
             dim=1,
-            index=output_ids.unsqueeze(1),
-            src=self.repetition_penalties,
+            index=index,
+            src=src,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
@@ -58,6 +72,15 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
 
     def get_scaling_penalties(self) -> torch.Tensor:
         return self.cumulated_repetition_penalties
+
+    def get_repetition_penalty_factors(self) -> torch.Tensor:
+        """Return the per-request scalar used for newly seen tokens.
+
+        The accumulated scaling table only tells whether a vocabulary item was
+        already seen. Verify-chain causal accounting also needs the scalar to
+        apply when an earlier draft token first becomes visible to a later row.
+        """
+        return self.repetition_penalties
 
     def _filter(self, keep_indices: torch.Tensor):
         self.repetition_penalties = self.repetition_penalties[keep_indices]

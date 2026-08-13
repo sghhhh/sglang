@@ -2194,6 +2194,14 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
             self.process_decode_queue()
 
+            # Keep DFlash-family penalty state in lockstep with the retained
+            # CPU output before the disaggregated decode scheduler prepares the
+            # next speculative batch.  This is the same conservative boundary
+            # used by Scheduler.event_loop_overlap.
+            drained_dflash_penalty_result = self._has_pending_dflash_penalty_result()
+            if drained_dflash_penalty_result:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
                 running_batch=self.running_batch
@@ -2209,7 +2217,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, last_batch=self.last_batch
             )
 
-            if disable_overlap_for_batch and self.last_batch:
+            if disable_overlap_for_batch and self.result_queue:
                 pop_and_process()
 
             # Launch the current batch
@@ -2222,7 +2230,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if (
+                    not disable_overlap_for_batch
+                    and not drained_dflash_penalty_result
+                    and self.result_queue
+                ):
                     pop_and_process()
             elif batch is None:
                 self.on_idle()

@@ -42,15 +42,50 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
-            output_ids (torch.Tensor): The output tokens.
+            output_ids (torch.Tensor): ``[batch_size]`` when a step commits one
+                token per request, or ``[batch_size, max_new]`` when speculative
+                decoding commits several.
+            mask: Optional boolean tensor shaped like ``output_ids``. It marks
+                real token positions in a ragged speculative step so padding is
+                a no-op for every penalizer.
         """
-        for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+        if output_ids.ndim == 1:
+            if mask is not None and mask.shape != output_ids.shape:
+                raise ValueError(
+                    "1-D penalty mask must have the same shape as output_ids, "
+                    f"got {tuple(mask.shape)} and {tuple(output_ids.shape)}."
+                )
+            for penalizer in self.penalizers.values():
+                penalizer.cumulate_output_tokens(output_ids=output_ids, mask=mask)
+            return
+
+        if output_ids.ndim != 2:
+            raise ValueError(
+                "output_ids must be 1-D or 2-D, "
+                f"got shape={tuple(output_ids.shape)}."
+            )
+        if mask is not None and mask.shape != output_ids.shape:
+            raise ValueError(
+                "2-D penalty mask must have the same shape as output_ids, "
+                f"got {tuple(mask.shape)} and {tuple(output_ids.shape)}."
+            )
+
+        # Accumulate each accepted position in order. Keeping the penalizer API
+        # 1-D avoids scatter_'s duplicate-index behavior for repeated tokens in
+        # the same speculative run (for example [x, x, y]).
+        for step in range(output_ids.shape[1]):
+            step_mask = None if mask is None else mask[:, step]
+            for penalizer in self.penalizers.values():
+                penalizer.cumulate_output_tokens(
+                    output_ids=output_ids[:, step], mask=step_mask
+                )
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -102,6 +137,24 @@ class BatchedPenalizerOrchestrator:
             else:
                 result *= penalizer.get_scaling_penalties()
         return result
+
+    def get_repetition_penalty_factors(self) -> Optional[torch.Tensor]:
+        """Snapshot the per-request repetition factor, if repetition is active.
+
+        This deliberately exposes the scalar separately from the accumulated
+        scaling table: an all-ones table cannot distinguish a token that is
+        unseen from a request whose repetition factor itself is one.
+        """
+        # Import locally to avoid the repetition penalizer's dependency on this
+        # module during class construction.
+        from sglang.srt.sampling.penaltylib.repetition_penalty import (
+            BatchedRepetitionPenalizer,
+        )
+
+        penalizer = self.penalizers.get(BatchedRepetitionPenalizer)
+        if penalizer is None or not penalizer.is_prepared():
+            return None
+        return penalizer.get_repetition_penalty_factors().clone()
 
     def filter(self, keep_indices: torch.Tensor):
         """
@@ -209,11 +262,13 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        self._cumulate_output_tokens(output_ids=output_ids, mask=mask)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,10 +306,16 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+
+        ``output_ids`` is always ``[batch_size]``. When provided, ``mask`` is a
+        ``[batch_size]`` boolean tensor; rows set to False carry padding and must
+        not alter the accumulated state.
         """
         pass
 
