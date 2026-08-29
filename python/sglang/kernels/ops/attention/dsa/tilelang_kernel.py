@@ -46,6 +46,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
+_LOW_SMEM_SPARSE_ATTN_CUTOFF_BYTES = 128 * 1024
 
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
@@ -53,6 +54,22 @@ FP8_DTYPE = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 FP32 = "float32"
 INT32 = "int32"
 UINT8 = "uint8"
+
+
+@functools.cache
+def _get_cuda_shared_memory_per_block_optin() -> int | None:
+    if _is_hip or not torch.cuda.is_available():
+        return None
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    except (AssertionError, RuntimeError):
+        return None
+    return getattr(props, "shared_memory_per_block_optin", None)
+
+
+def _use_low_smem_sparse_attention_kernel() -> bool:
+    smem_limit = _get_cuda_shared_memory_per_block_optin()
+    return smem_limit is not None and smem_limit < _LOW_SMEM_SPARSE_ATTN_CUTOFF_BYTES
 
 
 def fast_log2_ceil(x):
@@ -1380,9 +1397,21 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        kernel = sparse_attention_fwd_kernel_v2(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
-        )
+        if _use_low_smem_sparse_attention_kernel():
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=64,
+                num_stages=1,
+                threads=128,
+            )
+        else:
+            kernel = sparse_attention_fwd_kernel_v2(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
