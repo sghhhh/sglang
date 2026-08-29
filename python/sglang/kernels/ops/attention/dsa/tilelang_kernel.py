@@ -46,6 +46,8 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
+# Dynamic shared memory used by the v1 64/1/128 GLM DSA launch config.
+_LOW_SMEM_SPARSE_ATTN_REQUIRED_BYTES = 74_752
 _LOW_SMEM_SPARSE_ATTN_CUTOFF_BYTES = 128 * 1024
 
 BF16 = "bfloat16"
@@ -69,7 +71,11 @@ def _get_cuda_shared_memory_per_block_optin() -> int | None:
 
 def _use_low_smem_sparse_attention_kernel() -> bool:
     smem_limit = _get_cuda_shared_memory_per_block_optin()
-    return smem_limit is not None and smem_limit < _LOW_SMEM_SPARSE_ATTN_CUTOFF_BYTES
+    return smem_limit is not None and (
+        _LOW_SMEM_SPARSE_ATTN_REQUIRED_BYTES
+        <= smem_limit
+        < _LOW_SMEM_SPARSE_ATTN_CUTOFF_BYTES
+    )
 
 
 def fast_log2_ceil(x):

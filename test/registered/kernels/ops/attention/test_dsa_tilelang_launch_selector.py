@@ -43,29 +43,33 @@ class TestDSATilelangLaunchSelector(CustomTestCase):
         )
         v2.assert_not_called()
 
-    def test_high_smem_device_keeps_v2_config(self):
-        q, kv, indices = self._inputs()
-        compiled_kernel = mock.Mock(return_value=torch.empty(1))
+    def test_non_target_smem_device_keeps_v2_config(self):
+        for smem_limit in (64 * 1024, 128 * 1024):
+            with self.subTest(smem_limit=smem_limit):
+                q, kv, indices = self._inputs()
+                compiled_kernel = mock.Mock(return_value=torch.empty(1))
 
-        with (
-            mock.patch.object(
-                tilelang_dsa,
-                "_get_cuda_shared_memory_per_block_optin",
-                return_value=128 * 1024,
-            ),
-            mock.patch.object(tilelang_dsa, "sparse_attention_fwd_kernel_v1") as v1,
-            mock.patch.object(
-                tilelang_dsa,
-                "sparse_attention_fwd_kernel_v2",
-                return_value=compiled_kernel,
-            ) as v2,
-        ):
-            tilelang_dsa.tilelang_sparse_fwd(
-                q, kv, indices, sm_scale=0.125, d_v=256
-            )
+                with (
+                    mock.patch.object(
+                        tilelang_dsa,
+                        "_get_cuda_shared_memory_per_block_optin",
+                        return_value=smem_limit,
+                    ),
+                    mock.patch.object(
+                        tilelang_dsa, "sparse_attention_fwd_kernel_v1"
+                    ) as v1,
+                    mock.patch.object(
+                        tilelang_dsa,
+                        "sparse_attention_fwd_kernel_v2",
+                        return_value=compiled_kernel,
+                    ) as v2,
+                ):
+                    tilelang_dsa.tilelang_sparse_fwd(
+                        q, kv, indices, sm_scale=0.125, d_v=256
+                    )
 
-        v1.assert_not_called()
-        v2.assert_called_once_with(64, 256, 0, 2048, sm_scale=0.125)
+                v1.assert_not_called()
+                v2.assert_called_once_with(64, 256, 0, 2048, sm_scale=0.125)
 
     @staticmethod
     def _inputs():
