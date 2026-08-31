@@ -2907,6 +2907,13 @@ class ServerArgs:
         "available backend.",
         NS("mm"),
     ] = "auto"
+    disable_gpu_image_decode: A[
+        bool,
+        "Disable CUDA JPEG decoding in the tokenizer process and decode images "
+        "on CPU. Combine with --image-processor-backend=pil to keep generic "
+        "image preprocessing on CPU.",
+        NS("mm"),
+    ] = False
     mm_global_cache_backend: A[
         str,
         Arg(

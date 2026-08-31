@@ -81,6 +81,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         mm_processor_worker_num=0,
         mm_io_worker_num=0,
         image_processor=None,
+        disable_gpu_image_decode=False,
     ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
@@ -96,6 +97,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             tokenizer_worker_num=1,
             trust_mm_content_hashes=False,
             media_url_max_file_size_mb=64,
+            disable_gpu_image_decode=disable_gpu_image_decode,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -115,6 +117,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             trust_mm_content_hashes=False,
             media_url_max_file_size_mb=64,
             disable_fast_image_processor=False,
+            disable_gpu_image_decode=disable_gpu_image_decode,
         )
 
         hf_config = MagicMock()
@@ -150,6 +153,14 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.image_config, {})
         self.assertEqual(proc.video_config, {})
         self.assertEqual(proc.audio_config, {})
+
+    def test_gpu_image_decode_is_enabled_by_default(self):
+        proc = self._make_processor({})
+        self.assertTrue(proc.image_decode_mode)
+
+    def test_gpu_image_decode_can_be_disabled(self):
+        proc = self._make_processor({}, disable_gpu_image_decode=True)
+        self.assertFalse(proc.image_decode_mode)
 
     def test_model_specific_auto_worker_count_enables_executor(self):
         from sglang.srt.multimodal.processors.base_processor import (

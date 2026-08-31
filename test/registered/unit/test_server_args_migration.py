@@ -128,6 +128,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 sa = self._parse(["--image-processor-backend", backend])
                 self.assertEqual(sa.image_processor_backend, backend)
 
+    def test_disable_gpu_image_decode(self):
+        sa = self._parse(["--disable-gpu-image-decode"])
+        self.assertTrue(sa.disable_gpu_image_decode)
+
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
         serial = self._parse([])

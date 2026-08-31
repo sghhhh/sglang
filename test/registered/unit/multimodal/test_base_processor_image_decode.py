@@ -44,6 +44,10 @@ class _StubProcessor(BaseMultimodalProcessor):
         raise NotImplementedError
 
 
+class _GpuDecodeStubProcessor(_StubProcessor):
+    gpu_image_decode = True
+
+
 def _png_bytes(mode: str = "RGB", size=(8, 8)) -> bytes:
     arr = (np.random.RandomState(0).rand(size[1], size[0], 3) * 255).astype("uint8")
     img = Image.fromarray(arr, "RGB").convert(mode)
@@ -94,6 +98,27 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         img = _StubProcessor._load_single_item(data, Modality.IMAGE)
         ref = Image.open(io.BytesIO(data)).convert("RGB")
         np.testing.assert_array_equal(np.asarray(img), np.asarray(ref))
+
+    def test_loader_can_disable_gpu_decode_per_processor_instance(self):
+        processor = object.__new__(_GpuDecodeStubProcessor)
+        processor.image_decode_mode = False
+        processor.io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        expected = Image.open(io.BytesIO(_jpeg_bytes())).convert("RGB")
+
+        try:
+            with patch(
+                "sglang.srt.multimodal.processors.base_processor.load_image",
+                return_value=(expected, None),
+            ) as load:
+                futures = processor._submit_mm_data_loading_tasks_simple(
+                    [_jpeg_bytes()], Modality.IMAGE, None, True
+                )
+                self.assertIs(futures[0][2].result(), expected)
+        finally:
+            processor.io_executor.shutdown(wait=True)
+
+        load.assert_called_once()
+        self.assertFalse(load.call_args.args[1])
 
     def test_fast_loader_preserves_invalid_input_as_value_error(self):
         processor = object.__new__(_StubProcessor)
